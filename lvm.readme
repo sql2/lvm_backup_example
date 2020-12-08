@@ -1,0 +1,91 @@
+
+# DIRECT-LVM MODE FOR DOCKER
+
+# 1.13.1 버전부터 Overlay2 또는 Overlay가 Devicemapper대신 기본 스토리지 드라이버로 설정되어 올라옵니다. (커널이 지원한다는 가정하에)
+
+# loop-lvm: sparse 파일을 이용하여 이미지와 컨테이너 스냅샷이 사용하는 가상 풀을 생성합니다.
+# sparse 파일은 저장장치가 꽉 차거나 디스크 크기 할당량 초과 시 쓰기 문제가 발생 할 수 있습니다.
+# 또한 모든 복사와 백업에 대한 완벽한 지원을 보장하지 않습니다. 속도가 느립니다..
+
+# direct-lvm: 드라이버가 할당된 lvm 블록 장치에 직접 read/write를 수행합니다.
+
+$ yum install -y lvm2 
+
+# 도커 데몬 중단
+$ systemctl stop docker
+
+# 물리 디스크 LVM 설정
+$ lsblk
+
+sdb
+
+$ fdisk /dev/sdb
+...
+Command (m for help): t
+Selected partition 1
+Hex code (type L to list all codes): 8e
+Changed type of partition 'Linux' to 'Linux LVM'
+
+$ fdisk -l /dev/sdb
+
+#  물리적 볼륨 생성
+$ pvcreate /dev/sdb
+
+# 도커 불륨 그룹 생성
+$ vgcreate docker /dev/sdb
+
+
+# thinpool과 thinpoolmeta라는 이름의 논리 볼륨 생성
+# 저장공간이 부족 할 때를 대비하여 95%의 논리 데이터를 할당하였습니다.
+# 이후 공간이 부족 할 때 임시 방편으로 데이터나 메타데이터를 자동으로 확장하기 위함입니다.
+
+$ lvcreate --wipesignatures y -n thinpool docker -l 95%VG
+$ lvcreate --wipesignatures y -n thinpoolmeta docker -l 1%VG
+
+# 해당 풀을 thin pool로 컨버팅
+
+$ lvconvert -y \
+--zero n \
+-c 512K \
+--thinpool docker/thinpool \
+--poolmetadata docker/thinpoolmeta
+
+# LVM 프로필을 이용하여 해당 풀의 자동 확장 기능을 설정합니다
+# thin_pool_autoextend_threshold: autoextend가 발생되는 시기를 정의하는 %값입니다. 
+# thin_pool_autoextend_percent: autoextend가 진행되었을 때 확장 가능한 디스크 %을 설정합니다.
+
+$ cat /etc/lvm/profile/docker-thinpool.profile
+activation {
+    thin_pool_autoextend_threshold=80
+    thin_pool_autoextend_percent=10
+}
+
+# Apply the LVM profile, using the lvchange command.
+$ lvchange --metadataprofile docker-thinpool docker/thinpool
+
+# 새로운 lvm 프로필을 적용
+$ lvs -o+seg_monitor
+
+# => not monitored, set monitor
+$ lvchange --monitor y docker/thinpool
+
+# 기존에 사용하는 도커가 있다면 백업
+$ mkdir /var/lib/docker.bk
+$ mv /var/lib/docker/* /var/lib/docker.bk
+
+# devicemapper 옵션
+$ cat /dev/docker/daemon.json
+{
+    "storage-driver": "devicemapper",
+    "storage-opts": [
+        "dm.thinpooldev=/dev/mapper/docker-thinpool",
+        "dm.use_deferred_removal=true",
+        "dm.use_deferred_deletion=true"
+    ]
+}
+
+$ systemctl start docker
+
+# 호스트서버에서 devicemapper 구조 확인
+$ lsblk 
+
